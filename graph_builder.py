@@ -1,30 +1,35 @@
-# graph_builder.py
+# graph_builder.py (수정된 최종 버전)
 import logging
-from typing import Literal, Dict, Any, List
-from datetime import datetime
-import uuid
+from typing import Literal, List
+import json
 
-#from langchain_aws import ChatBedrockConverse
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from pydantic import BaseModel, Field
 from langgraph.graph import MessagesState, StateGraph, START, END
 from langgraph.prebuilt import create_react_agent
-from langgraph.checkpoint import MemorySaver
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 
-
 # MCP 클라이언트 모듈에서 도구들을 임포트합니다.
-from mcp_client import evaluate_loan_application, get_applicant_information
+from mcp_client import evaluate_loan_application_tool, get_applicant_information_tool
 
 logger = logging.getLogger(__name__)
 
-# --- LangGraph 상태, LLM 및 에이전트 설정 ---
+# --- LangGraph 상태 정의 ---
 class AgentState(MessagesState):
-    node_count: int = 0
-    next: str = Field(default=None)
+    next_node: str = None
 
-SUPERVISOR_SYSTEM_PROMPT = (
-    """[Persona]
+# --- LLM 및 에이전트 설정 ---
+llm = ChatOllama(model="qwen3:8b", temperature=0.1)
+
+# --- Supervisor 설정 ---
+MEMBERS = ["data_fetcher", "evaluator_credit"]
+
+class Router(BaseModel):
+    next: Literal["data_fetcher", "evaluator_credit", "FINISH"]
+
+SUPERVISOR_SYSTEM_PROMPT = """
+[Persona]
 당신은 [Agents]들을 관리하는 Supervisor Agent입니다. 
 
 [Instruction]
@@ -33,152 +38,108 @@ SUPERVISOR_SYSTEM_PROMPT = (
 - 지원자의 신용 검사 결과를 가져오면 FINISH를 응답하십시오.
 
 [Agents]
-1.  data_fetcher 
+1. data_fetcher 
 - 지원자의 정보를 가져와 알려준다.
 - 정보 : income, employment_years, credit_score, existing_debt, requested_amount
 
 2. evaluator_credit :
 - 지원자의 정보를 사용하여 신용 심사 평가를 진행한 후 심사 결과를 가져와 알려준다.
-- 심사 결과 : decision, score, reasons"""
+- 심사 결과 : decision, score, reasons
+
+주어진 대화 내용에 따라 다음 단계에 가장 적합한 옵션을 Router 형식으로 결정하세요.
+"""
+
+supervisor_chain = (
+    SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT)
+    + HumanMessage(content="{messages}")
+    | llm.with_structured_output(Router)
 )
 
-DEFAULT_SYSTEM_PROMPT = (
-    SUPERVISOR_SYSTEM_PROMPT  # Using the ReAct specific prompt when tools are present
-)
-QUERY_THREAD_ID = str(uuid.uuid4())
-DEFAULT_TEMPERATURE = 0.1
-# astream_log is used to display the data generated during the processing process.
-USE_ASTREAM_LOG = True
-# LLM model settings that support Tool calling
-QWEN3_14B = "qwen3:14b"  # default model
-QWEN3 = QWEN3_14B
-
-# Create chat model
-def create_chat_model(
-    temperature: float = DEFAULT_TEMPERATURE,
-    # streaming: bool = True, # Streaming is handled by LangChain methods like .astream
-    system_prompt: Optional[str] = None,  # Will be used by the agent if provided
-    mcp_tools: Optional[List] = None,
-) -> ChatOllama | CompiledGraph:
-    # Create Chat model: Requires LLM with Tool support
-    chat_model = ChatOllama(
-        model=QWEN3,
-        temperature=temperature,
-    )
-
-    # Create ReAct agent (when MCP tools are available)
-    if mcp_tools:
-        # Make sure the prompt used here aligns with what create_react_agent expects
-        # The MCP_CHAT_PROMPT includes placeholders {tools} and {tool_names}
-        # which create_react_agent should fill.
-        agent_executor = create_react_agent(
-            model=chat_model, tools=mcp_tools, checkpointer=MemorySaver()
-        )
-        print("ReAct agent created.")
-        return agent_executor  # Return the agent executor graph
-    else:
-        print("No MCP tools provided. Using plain Gemini model.")
-        # If no tools, you might want a simpler system prompt
-        # The default behavior without tools might just be the raw chat model.
-        # Binding a default System prompt if needed:
-        # return SystemMessage(content=system_prompt or "You are a helpful AI assistant.") | chat_model
-        return chat_model  # Return the base model if no tools
-    
-# llm = ChatBedrockConverse(
-#     model="anthropic.claude-3-haiku-20240307-v1:0",
-#     temperature=0, max_tokens=2048, region_name='us-east-1'
-# )
-# llm_selector = ChatBedrockConverse(
-#     model='anthropic.claude-3-sonnet-20240229-v1:0',
-#     temperature=0, max_tokens=1024, region_name='us-east-1'
-# )
-
-MEMBERS = ["data_fetcher","evaluator_credit","decision_maker"]
-OPTIONS = MEMBERS + ["FINISH", "summarizer"]
-
-class Router(BaseModel):
-    next: Literal[*OPTIONS]
-
-# --- 그래프 노드 정의 ---
-def supervisor_node(state: AgentState) -> Dict[str, Any]:
-    """워크플로우를 라우팅하는 Supervisor 노드."""
-    logger.info(f"--- SUPERVISOR (Node Count: {state['node_count']}) ---")
-    if state['node_count'] > 5:
-        logger.warning("Node count exceeded limit. Forcing summarization.")
-        return {"next": "summarizer"}
-
-    prompt = SUPERVISOR_SYSTEM_PROMPT
-    messages = [SystemMessage(content=prompt)] + state['messages']
-    
-    structured_llm = llm_selector.with_structured_output(Router)
-    
-    try:
-        response = structured_llm.invoke(messages)
-        logger.info(f"Supervisor decision: '{response.next}'")
-        return {"next": "summarizer" if response.next == "FINISH" else response.next}
-    except Exception as e:
-        logger.error(f"Supervisor LLM failed: {e}. Defaulting to summarizer.")
-        return {"next": "summarizer"}
-
-def agent_node_wrapper(agent, name):
-    """에이전트를 호출하고 그래프 상태를 업데이트하는 래퍼입니다."""
-    async def node_function(state: AgentState) -> Dict[str, Any]:
-        logger.info(f"--- AGENT: {name} ---")
-        result = await agent.ainvoke(state)
-        
-        if isinstance(result['messages'][-1], ToolMessage):
-             return {"messages": result['messages']}
-
-        return {
-            "messages": [AIMessage(content=result['messages'][-1].content, name=name)],
-            "node_count": state['node_count'] + 1
-        }
-    return node_function
-
-def summary_node(state: AgentState) -> Dict[str, List[AIMessage]]:
-    """최종 답변을 생성하는 요약 노드입니다."""
-    logger.info("--- SUMMARIZER ---")
-    prompt = [
-        SystemMessage(content="모든 대화 내용을 종합하여 사용자의 초기 질문에 대한 최종 답변을 한국어로 생성합니다. 최종 사용자에게 직접 전달되는 답변이므로 친절하고 명확한 어조를 사용하세요."),
-    ] + state['messages']
-    result = llm.invoke(prompt)
-    return {"messages": [result]}
+# --- 에이전트 프롬프트 ---
+DATA_FETCHER_PROMPT = "당신은 데이터 수집 전문가입니다. get_applicant_information 도구를 사용해 지원자의 상세 정보를 조회하세요."
+EVALUATOR_PROMPT = "당신은 대출 심사 전문가입니다. 주어진 정보를 바탕으로 evaluate_loan_application 도구를 사용해 대출 심사를 수행하고 결과를 보고하세요."
 
 # --- 그래프 구성 ---
 def build_graph():
     """LangGraph 워크플로우를 구성하고 컴파일합니다."""
-    loan_underwriter_agent = create_react_agent(
-        llm, tools=[evaluate_loan_application, get_applicant_information]
+    
+    data_fetcher_agent = create_react_agent(llm, tools=[get_applicant_information_tool])
+    evaluator_agent = create_react_agent(llm, tools=[evaluate_loan_application_tool])
+
+    # 그래프 빌더 생성
+    workflow = StateGraph(AgentState)
+
+    def data_fetcher_node(state: AgentState):
+        """데이터 수집 에이전트를 위한 노드. 호출 직전에 시스템 프롬프트를 주입합니다."""
+        # state['messages']는 수정할 수 없으므로, 프롬프트가 추가된 새 리스트를 전달
+        logger.info(f"data_fetcher_node 진입 완료")
+
+        messages_with_prompt = [SystemMessage(content=DATA_FETCHER_PROMPT)] + state['messages']
+        result = data_fetcher_agent.invoke({"messages": messages_with_prompt})
+        print(f"데이터 수집 에이전트 결과 :{result}")
+        # AIMessage만 남겨서 다음 supervisor가 판단할 때 혼란을 주지 않도록 함
+        return {"messages": result['messages']}
+    
+    def evaluator_node(state: AgentState):
+        """평가 에이전트를 위한 노드. 호출 직전에 시스템 프롬프트를 주입합니다."""
+        messages_with_prompt = [SystemMessage(content=EVALUATOR_PROMPT)] + state['messages']
+        result = evaluator_agent.invoke({"messages": messages_with_prompt})
+        print(f"평가 에이전트 결과 :{result}")
+        return {"messages": result['messages']}
+    
+    # 노드 추가
+    workflow.add_node("data_fetcher", data_fetcher_node)
+    workflow.add_node("evaluator_credit", evaluator_node)
+    
+    def supervisor_node(state: AgentState):
+        logger.info("--- SUPERVISOR ---")
+        response = supervisor_chain.invoke({"messages": [state['messages']]})
+        logger.info(f"Supervisor decision: '{response.next}'")
+        return {"next_node": response.next}
+
+    workflow.add_node("supervisor", supervisor_node)
+
+    # 엣지 추가
+    workflow.add_edge("data_fetcher", "supervisor")
+    workflow.add_edge("evaluator_credit", "supervisor")
+    
+    def route_supervisor(state: AgentState):
+        return state.get("next_node")
+
+    workflow.add_conditional_edges(
+        "supervisor", 
+        route_supervisor,
+        {"data_fetcher": "data_fetcher", "evaluator_credit": "evaluator_credit", "FINISH": END}
     )
-    builder = StateGraph(AgentState)
-    builder.add_node("supervisor", supervisor_node)
-    builder.add_node("loan_underwriter", agent_node_wrapper(loan_underwriter_agent, "loan_underwriter"))
-    builder.add_node("summarizer", summary_node)
-    builder.add_edge(START, "supervisor")
-    builder.add_edge("loan_underwriter", "supervisor")
-    builder.add_conditional_edges("supervisor", lambda s: s['next'], {
-        "loan_underwriter": "loan_underwriter", "summarizer": "summarizer"
-    })
-    builder.add_edge("summarizer", END)
-    return builder.compile(checkpointer=MemorySaver())
+    
+    workflow.add_edge(START, "supervisor")
+    
+    return workflow.compile(checkpointer=MemorySaver())
 
 async def run_graph(graph, user_input):
     """주어진 입력으로 그래프를 실행하고 결과를 스트리밍합니다."""
-    config = {"configurable": {"thread_id": "user-thread"}}
-    node_name = ''
+    config = {"configurable": {"thread_id": f"user-thread-{hash(user_input)}"}}
     
-    async for event in graph.astream_events({"messages": [HumanMessage(content=user_input)]}, config=config, version="v2"):
-        kind = event["event"]
-        if kind == "on_chain_start" and event["name"] != "LangGraph":
-            current_node = event["name"]
-            if node_name != current_node:
-                print(f"\n\n\n==================================\nEntering Node: {current_node.upper()}\n==================================", flush=True)
-                node_name = current_node
-        
-        if kind == "on_chain_stream":
-            chunk = event["data"]["chunk"]
-            if isinstance(chunk, AIMessage): print(chunk.content, end="", flush=True)
-            elif isinstance(chunk, ToolMessage): print(f"\nTool Output: {chunk.content}", flush=True)
+    try:
+        final_state = await graph.ainvoke(
+            {"messages": [HumanMessage(content=user_input)]}, 
+            config=config, 
+        )
 
-    final_state = await graph.aget_state(config)
-    print(f"\n\n==================================\nFinal Answer:\n==================================\n{final_state.values['messages'][-1].content}")
+        # 최종 결과 출력
+        final_message = final_state['messages'][-1]
+        print("\n\n✅ 최종 심사 결과 요약:")
+        print("="*30)
+        
+        if isinstance(final_message, ToolMessage):
+            try:
+                data = json.loads(final_message.content)
+                print(json.dumps(data, indent=2, ensure_ascii=False))
+            except json.JSONDecodeError:
+                 print(final_message.content)
+        else:
+             print(final_message.content)
+
+    except Exception as e:
+        logger.error(f"Graph execution failed: {e}", exc_info=True)
+        print(f"\n오류가 발생했습니다: {str(e)}")

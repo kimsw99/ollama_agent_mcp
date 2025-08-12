@@ -1,12 +1,18 @@
-# server.py
-from typing import Dict, List, Any
-from pydantic import BaseModel
+# mcp_server.py
 import json
+import asyncio
+import logging
+from typing import Dict, List, Any, Optional
+from pydantic import BaseModel
 
-try:
-    from mcp.server.fastmcp import FastMCP
-except ImportError:
-    from mcp import FastMCP
+# MCP 서버 구현
+from mcp.server.fastmcp import FastMCP
+from mcp.server import NotificationOptions, Server
+from mcp import types
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- 데이터 모델 ---
 class Applicant(BaseModel):
@@ -23,7 +29,7 @@ class Decision(BaseModel):
     score: int
     reasons: List[str]
 
-# --- 간단 In-memory DB (샘플) ---
+# --- 샘플 데이터 ---
 APPLICANTS: Dict[str, Applicant] = {
     "A001": Applicant(
         id="A001", name="Alice Kim", income=60000, employment_years=5,
@@ -38,29 +44,21 @@ APPLICANTS: Dict[str, Applicant] = {
 # --- FastMCP 서버 인스턴스 ---
 mcp = FastMCP("loan-underwriter")
 
-# --- 점수 계산 로직(헬퍼 함수, 서버/에이전트에서 재사용 가능) ---
 def calculate_score_logic(app: Applicant) -> int:
-    """
-    간단 가중치 점수:
-     - 신용점수(300-850)를 0-100 스케일 -> weight 40%
-     - 소득 (정규화 50k 기준) -> weight 30%
-     - 근속연수 (10년 이상 안정) -> weight 15%
-     - 부채비율 기반 패널티 -> weight 15%
-    """
+    """점수 계산 로직"""
     # credit score -> 0..100
-    base_credit = (app.credit_score - 300) / 550 * 100  # (850-300 = 550)
-
+    base_credit = (app.credit_score - 300) / 550 * 100
+    
     # income score (normalize by 50k cap)
     income_score = min(app.income / 50000.0, 1.0) * 100
-
+    
     # employment score (cap at 10 years)
     employment_score = min(app.employment_years / 10.0, 1.0) * 100
-
+    
     # debt effect: debt-to-income (DTI)
-    dti = app.existing_debt / max(app.income, 1.0)  # 안전한 나눗셈
-    # convert to a 0..100 style where higher DTI reduces score (cap effect)
+    dti = app.existing_debt / max(app.income, 1.0)
     debt_penalty_score = max(0.0, 100.0 - min(dti, 2.0) * 50.0)
-
+    
     weighted = (
         base_credit * 0.40 +
         income_score * 0.30 +
@@ -69,63 +67,65 @@ def calculate_score_logic(app: Applicant) -> int:
     )
     return int(round(weighted))
 
-# --- MCP Resource: applicant://{id} ---
+# --- MCP Resource ---
 @mcp.resource("applicant://{applicant_id}")
-def get_applicant(applicant_id: str) -> str:
-    """리소스: 신청자 정보 조회 (LLM/클라이언트가 읽어가는 용도)"""
+def get_applicant_resource(applicant_id: str) -> str:
+    """리소스: 신청자 정보 조회"""
     if applicant_id not in APPLICANTS:
         raise ValueError(f"Applicant {applicant_id} not found")
     
     applicant = APPLICANTS[applicant_id]
-    # JSON 문자열로 반환 (MCP 리소스는 문자열을 기대함)
     return json.dumps(applicant.model_dump(), indent=2)
 
-# --- MCP Tool: calculate_score(applicant_id) ---
+# --- MCP Tools ---
 @mcp.tool()
-def calculate_score(applicant_id: str) -> Dict[str, Any]:
-    """Tool: 신청자의 점수를 반환 (LLM/클라이언트가 호출 가능)"""
+def get_applicant_information(applicant_id: str) -> Dict[str, Any]:
+    """Tool: 신청자 정보 가져오기 (LangGraph에서 사용)"""
     if applicant_id not in APPLICANTS:
         return {"error": f"Applicant {applicant_id} not found"}
     
-    a = APPLICANTS[applicant_id]
-    score = calculate_score_logic(a)
-    return {"applicant_id": applicant_id, "score": score}
+    applicant = APPLICANTS[applicant_id]
+    return {
+        "applicant_id": applicant_id,
+        "name": applicant.name,
+        "income": applicant.income,
+        "employment_years": applicant.employment_years,
+        "credit_score": applicant.credit_score,
+        "existing_debt": applicant.existing_debt,
+        "requested_amount": applicant.requested_amount
+    }
 
-# --- MCP Tool: evaluate_application(applicant_id) ---
 @mcp.tool()
-def evaluate_application(applicant_id: str) -> Dict[str, Any]:
-    """
-    Tool: 규칙 기반 심사 로직 적용 (구체적인 규칙은 예시)
-    Decision: approve / refer / decline
-    - approve: score >= 70, 특별 위험요인 없음
-    - refer: 50 <= score < 70  또는 보완 확인 필요한 경우
-    - decline: score < 50 또는 명백한 거절 사유
-    """
+def evaluate_loan_application(applicant_id: str) -> Dict[str, Any]:
+    """Tool: 대출 신청 평가 (LangGraph에서 사용)"""
     if applicant_id not in APPLICANTS:
         return {"error": f"Applicant {applicant_id} not found"}
     
-    a = APPLICANTS[applicant_id]
-    score = calculate_score_logic(a)
+    applicant = APPLICANTS[applicant_id]
+    score = calculate_score_logic(applicant)
     reasons: List[str] = []
 
-    # 간단한 blacklist-ish rule 예시
-    if a.credit_score < 580:
-        reasons.append("Credit score below 580.")
-    if a.income < 24000:
-        reasons.append("Income below 24k.")
-    if a.requested_amount > a.income * 8:
-        reasons.append("Requested amount > 8x annual income.")
+    # 심사 규칙
+    if applicant.credit_score < 580:
+        reasons.append("신용점수가 580점 미만입니다.")
+    if applicant.income < 24000:
+        reasons.append("연소득이 24,000달러 미만입니다.")
+    if applicant.requested_amount > applicant.income * 8:
+        reasons.append("신청 금액이 연소득의 8배를 초과합니다.")
 
+    # 결정 로직
     if score >= 70 and not reasons:
         decision = "approve"
+        reasons.append("신용점수와 재정상태가 우수합니다.")
     elif score >= 50:
-        decision = "refer"   # 담당자 검토 필요
-        if "Manual review recommended" not in reasons:
-            reasons.append("Manual review recommended due to moderate score.")
+        decision = "refer"
+        if not reasons:
+            reasons.append("담당자 검토가 필요한 중간 점수입니다.")
     else:
         decision = "decline"
+        if not reasons:
+            reasons.append("신용점수 또는 재정상태가 기준에 미달합니다.")
 
-    # Dictionary로 반환 (MCP tools는 JSON serializable 객체를 기대함)
     return {
         "decision": decision,
         "score": score,
@@ -133,9 +133,22 @@ def evaluate_application(applicant_id: str) -> Dict[str, Any]:
         "applicant_id": applicant_id
     }
 
-# --- 직접 실행 시 서버 실행 ---
+@mcp.tool()
+def calculate_score(applicant_id: str) -> Dict[str, Any]:
+    """Tool: 점수만 계산"""
+    if applicant_id not in APPLICANTS:
+        return {"error": f"Applicant {applicant_id} not found"}
+    
+    applicant = APPLICANTS[applicant_id]
+    score = calculate_score_logic(applicant)
+    return {"applicant_id": applicant_id, "score": score}
+
+# --- 레거시 함수들 (기존 호환성) ---
+@mcp.tool()
+def evaluate_application(applicant_id: str) -> Dict[str, Any]:
+    """레거시 호환성을 위한 별칭"""
+    return evaluate_loan_application(applicant_id)
+
 if __name__ == "__main__":
-    # MCP 1.12.4에서는 stdio transport 사용
-    print("Starting MCP Loan Underwriter Server...")
-    print("Server running in stdio mode...")
+    logger.info("Starting MCP Loan Underwriter Server...")
     mcp.run(transport="stdio")

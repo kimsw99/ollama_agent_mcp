@@ -1,168 +1,120 @@
-# simple_client.py
+# mcp_client.py
 import asyncio
+import sys
+import os
 import logging
 import json
 import subprocess
-import sys
-import os
+from langchain_core.tools import tool
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# MCP 라이브러리 임포트
+from mcp.client.session import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from langchain_core.tools import StructuredTool 
+
 logger = logging.getLogger(__name__)
 
-async def main():
+# 모듈 전역 변수로 클라이언트 세션을 관리
+# MCPClientManager 컨텍스트 내에서 할당됨
+mcp_client_session: ClientSession = None
+
+class MCPClientManager:
     """
-    간단한 MCP 클라이언트 - subprocess와 직접 통신
+    MCP 서버 프로세스와 클라이언트 세션을 관리하는 비동기 컨텍스트 매니저.
+    'async with' 구문과 함께 사용되어 서버를 시작하고 세션을 설정하며,
+    블록을 빠져나갈 때 모든 것을 안전하게 종료합니다.
     """
-    
-    logger.info("MCP 서버와 직접 통신을 시작합니다...")
-    
-    try:
-        # 서버 프로세스 시작
-        server_process = subprocess.Popen(
-            [sys.executable, "mcp_server.py"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=0,  # 버퍼링 비활성화
-            env=dict(os.environ, PYTHONUNBUFFERED="1")  # Python 출력 버퍼링 비활성화
-        )
-        
-        await asyncio.sleep(1)  # 서버 시작 대기
-        
-        # MCP 클라이언트 세션 시작
-        from mcp.client.session import ClientSession
-        from mcp.client.stdio import StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        
-        # 서버 파라미터 설정
-        server_params = StdioServerParameters(
+    def __init__(self, server_script="mcp_server.py"):
+        self.server_script = server_script
+        self.server_params = StdioServerParameters(
             command=sys.executable,
-            args=["mcp_server.py"],
-            env=None
+            args=[self.server_script],
+            env=dict(os.environ, PYTHONUNBUFFERED="1")
         )
+        self._client = None
+        self._read = None
+        self._write = None
+        self._session_cm = None
+        self._client_cm = None
+
+    async def __aenter__(self):
+        """컨텍스트에 진입할 때 서버 시작 및 클라이언트 세션 초기화"""
+        global mcp_client_session
         
-        # stdio 클라이언트로 연결
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as client:
-                await run_client_operations(client)
-                
-    except ImportError as e:
-        logger.error(f"MCP 라이브러리 import 실패: {e}")
-        # 대안: 직접 JSON-RPC 통신 시도
-        await try_direct_communication()
-        
-    except Exception as e:
-        logger.error(f"에러 발생: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        
-    finally:
-        # 서버 프로세스 정리
-        if 'server_process' in locals():
-            try:
-                server_process.terminate()
-                server_process.wait(timeout=5)
-            except:
-                try:
-                    server_process.kill()
-                    server_process.wait()
-                except:
-                    pass
-
-
-async def run_client_operations(client):
-    """MCP 클라이언트 작업"""
-    try:
-        # 초기화
-        await client.initialize()
-        logger.info("✅ MCP 세션 초기화 성공!")
-
-        # Tools 목록
-        tools = await client.list_tools()
-        tool_names = [t.name for t in tools.tools]
-        logger.info(f"📋 사용 가능한 Tools: {tool_names}")
-
-        print("-" * 50)
-
-        # 리소스 읽기
-        logger.info("📄 리소스 읽기: applicant://A001")
+        logger.info(f"Starting MCP server with script: {self.server_script}")
         try:
-            resource = await client.read_resource("applicant://A001")
-            if resource.contents:
-                content = resource.contents[0]
-                if hasattr(content, 'text'):
-                    data = json.loads(content.text)
-                    logger.info("지원자 A001 정보:")
-                    for k, v in data.items():
-                        logger.info(f"  {k}: {v}")
+            self._session_cm = stdio_client(self.server_params)
+            self._read, self._write = await self._session_cm.__aenter__()
+            
+            self._client_cm = ClientSession(self._read, self._write)
+            self._client = await self._client_cm.__aenter__()
+            
+            await self._client.initialize()
+            logger.info("✅ MCP client session initialized successfully.")
+            
+            mcp_client_session = self._client # 전역 변수에 세션 할당
+            return self._client
         except Exception as e:
-            logger.error(f"리소스 읽기 실패: {e}")
+            logger.error(f"Failed to start MCP server or initialize client: {e}")
+            await self.__aexit__(*sys.exc_info()) # 실패 시 정리
+            raise
 
-        print("-" * 50)
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """컨텍스트를 빠져나갈 때 클라이언트와 서버 프로세스 종료"""
+        global mcp_client_session
+        
+        logger.info("Shutting down MCP client and server...")
+        if self._client_cm:
+            await self._client_cm.__aexit__(exc_type, exc_val, exc_tb)
+        if self._session_cm:
+            await self._session_cm.__aexit__(exc_type, exc_val, exc_tb)
+        
+        mcp_client_session = None # 전역 변수 초기화
+        logger.info("✅ MCP client and server shut down successfully.")
 
-        # Tool 호출 테스트
-        for applicant_id in ["A001", "A002"]:
-            logger.info(f"⚙️ 심사 평가: {applicant_id}")
-            try:
-                result = await client.call_tool("evaluate_application", {"applicant_id": applicant_id})
-                if result.content:
-                    content = result.content[0]
-                    if hasattr(content, 'text'):
-                        evaluation = json.loads(content.text)
-                        logger.info(f"결과 - 결정: {evaluation['decision'].upper()}")
-                        logger.info(f"     - 점수: {evaluation['score']}")
-                        logger.info(f"     - 사유: {evaluation['reasons']}")
-            except Exception as e:
-                logger.error(f"{applicant_id} 평가 실패: {e}")
+# --- LangGraph 에이전트가 사용할 도구들 ---
 
-    except Exception as e:
-        logger.error(f"클라이언트 작업 실패: {e}")
-
-
-async def try_direct_communication():
-    """직접 JSON-RPC 통신 시도 (fallback)"""
-    logger.info("🔧 직접 JSON-RPC 통신을 시도합니다...")
+async def get_applicant_information(applicant_id: str) -> str:
+    """
+    주어진 지원자 ID(applicant_id)에 해당하는 지원자의 상세 정보를 조회합니다.
+    (소득, 근무 연수, 신용 점수, 기존 부채, 요청 금액 포함)
+    """
+    if not mcp_client_session:
+        raise ConnectionError("MCP client session is not available.")
     
-    try:
-        # 서버 프로세스 시작
-        server_process = subprocess.Popen(
-            [sys.executable, "mcp_server.py"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        # 간단한 초기화 메시지 전송
-        init_msg = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "test-client", "version": "1.0"}
-            }
-        }
-        
-        # 메시지 전송
-        msg_str = json.dumps(init_msg) + "\n"
-        server_process.stdin.write(msg_str)
-        server_process.stdin.flush()
-        
-        # 응답 읽기
-        response = server_process.stdout.readline()
-        logger.info(f"서버 응답: {response.strip()}")
-        
-        # 프로세스 정리
-        server_process.terminate()
-        server_process.wait()
-        
-    except Exception as e:
-        logger.error(f"직접 통신도 실패: {e}")
+    logger.info(f"Tool calling MCP 'get_applicant_information' for ID: {applicant_id}")
+    result = await mcp_client_session.call_tool("get_applicant_information", {"applicant_id": applicant_id})
+    
+    if result.content and hasattr(result.content[0], 'text'):
+        data = json.loads(result.content[0].text)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    return "정보를 가져오지 못했습니다."
+
+get_applicant_information_tool = StructuredTool.from_function(
+    coroutine=get_applicant_information,
+    name="get_applicant_information",
+    description="주어진 지원자 ID(applicant_id)에 해당하는 지원자의 상세 정보를 조회합니다. (소득, 근무 연수, 신용 점수, 기존 부채, 요청 금액 포함)"
+)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def evaluate_loan_application(applicant_id: str) -> str:
+    """
+    주어진 지원자 ID(applicant_id)에 대해 대출 신청 심사를 수행하고,
+    그 결과(결정, 점수, 사유)를 반환합니다.
+    """
+    if not mcp_client_session:
+        raise ConnectionError("MCP client session is not available.")
+    
+    logger.info(f"Tool calling MCP 'evaluate_loan_application' for ID: {applicant_id}")
+    result = await mcp_client_session.call_tool("evaluate_loan_application", {"applicant_id": applicant_id})
+    
+    if result.content and hasattr(result.content[0], 'text'):
+        data = json.loads(result.content[0].text)
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    return "평가를 수행하지 못했습니다."
+
+evaluate_loan_application_tool = StructuredTool.from_function(
+    coroutine=evaluate_loan_application,
+    name="evaluate_loan_application",
+    description="주어진 지원자 ID(applicant_id)에 대해 대출 신청 심사를 수행하고, 그 결과(결정, 점수, 사유)를 반환합니다."
+)
