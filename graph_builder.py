@@ -73,7 +73,13 @@ PROMPTS = {
 - applicant_id 매개변수에 정확한 ID(예: A001)를 전달하세요
 - 조회 결과를 명확하게 정리하여 제시하세요
 
-사용자 입력에서 신청자 ID를 추출하고 해당 정보를 조회해주세요.
+도구 호출은 다음 JSON 형식을 사용하세요:
+
+<tool_call>
+{"name": "get_applicant_information", "arguments": {"applicant_id": "A001"}}
+</tool_call>
+
+사용자 입력에서 신청자 ID를 추출하고 해당 정보를 조회하고 끝내세요
 """,
     
     "risk_evaluator": """
@@ -83,6 +89,10 @@ PROMPTS = {
 1. 수집된 신청자 정보를 바탕으로 대출 평가를 수행하세요
 2. evaluate_loan_application 도구를 사용하여 종합 평가를 실행하세요
 3. 필요시 calculate_score 도구로 점수 상세 분석을 추가하세요
+
+<tool_call>
+{"name": "evaluate_loan_application", "arguments": {"applicant_id": "A001"}}
+</tool_call>
 
 평가 결과를 명확하게 설명하고 승인/거부 결정의 근거를 제시하세요.
 """,
@@ -122,14 +132,14 @@ class LoanProcessingGraph:
         """에이전트 노드 생성을 위한 팩토리 함수"""
         agent = create_react_agent(self.llm, tools=tools)
         
-        def agent_node(state: LoanProcessingState):
+        async def agent_node(state: LoanProcessingState):
             logger.info(f"🔄 Executing {agent_name}")
             
             # 시스템 프롬프트와 함께 메시지 구성
             messages_with_prompt = [SystemMessage(content=system_prompt)] + state['messages']
             
             try:
-                result = agent.invoke({"messages": messages_with_prompt})
+                result = await agent.ainvoke({"messages": messages_with_prompt})
                 logger.info(f"📨 message {result}")
                 # 마지막 메시지가 ToolMessage이고, 오류를 포함하는지 확인
                 last_message = result['messages'][-1]

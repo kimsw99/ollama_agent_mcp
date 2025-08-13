@@ -180,11 +180,12 @@ calculate_score_tool = StructuredTool.from_function(
 
 # 도구 목록 (편의를 위한 그룹화)
 ALL_TOOLS = [
-    list_applicants_tool,
+    #list_applicants_tool,
     get_applicant_information_tool,
     evaluate_loan_application_tool,
     calculate_score_tool
 ]
 
-DATA_TOOLS = [list_applicants_tool, get_applicant_information_tool]
+# DATA_TOOLS = [list_applicants_tool, get_applicant_information_tool]
+DATA_TOOLS = [get_applicant_information_tool]
 EVALUATION_TOOLS = [evaluate_loan_application_tool, calculate_score_tool]
