@@ -4,7 +4,7 @@ from typing import Literal, Dict, Any, List
 import json
 import re
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage,ToolMessage
 from pydantic import BaseModel, Field
 from langgraph.graph import MessagesState, StateGraph, START, END
 from langgraph.prebuilt import create_react_agent
@@ -130,6 +130,18 @@ class LoanProcessingGraph:
             
             try:
                 result = agent.invoke({"messages": messages_with_prompt})
+                logger.info(f"📨 message {result}")
+                # 마지막 메시지가 ToolMessage이고, 오류를 포함하는지 확인
+                last_message = result['messages'][-1]
+                if isinstance(last_message, ToolMessage) and "Error:" in last_message.content:
+                    logger.error(f"❌ Task-level error in {agent_name}: {last_message.content}")
+                    # 오류 상태를 명확히 하고 Supervisor가 다른 결정을 내리도록 유도
+                    return {
+                        "messages": state['messages'] + result['messages'],
+                        "error_count": state.get("error_count", 0) + 1
+                        # "next_node": "error_handler" 와 같은 별도 노드로 보낼 수도 있음
+                    }
+                
                 logger.info(f"✅ {agent_name} completed successfully")
                 
                 # 상태 업데이트
