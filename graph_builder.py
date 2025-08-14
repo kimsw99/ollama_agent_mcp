@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class LoanProcessingState(MessagesState):
     """대출 심사 프로세스의 상태를 관리"""
     next_node: str = None
-    applicant_id: str = None
+    applicant_id: str = "A001"
     processing_step: str = "start"
     error_count: int = 0
 
@@ -42,7 +42,7 @@ class WorkflowRouter(BaseModel):
 def create_llm(temperature: float = 0.1) -> ChatOllama:
     """최적화된 LLM 인스턴스 생성"""
     return ChatOllama(
-        model="qwen3:4b",  # 더 최신 모델로 변경
+        model="qwen3:8b",  # 더 최신 모델로 변경
         temperature=temperature,
         top_p=0.9,
         num_predict=512  # 응답 길이 제한으로 효율성 향상
@@ -51,13 +51,19 @@ def create_llm(temperature: float = 0.1) -> ChatOllama:
 # --- 에이전트 프롬프트 템플릿 ---
 PROMPTS = {
     "supervisor": """
+[Persona]
 당신은 대출 심사 프로세스를 조율하는 Supervisor Agent입니다.
 
-워크플로우:
-1. data_collector: 신청자 정보 수집
-2. risk_evaluator: 신용 위험 평가 및 심사 결정  
+[Child Agents]
+1. data_collector: 
+- get_applicant_information tool을 통해 신청자 정보 수집만 진행한다.
+- applicant_id, name, income, employment_years, credit_score, existing_debt, requested_amount, debt_to_income_ratio가 없을 경우 동작한다.
+2. risk_evaluator:  
+- applicant_id, name, income, employment_years, credit_score, existing_debt, requested_amount, debt_to_income_ratio의 정보가 있는 경우에 동작한다.
+- valuate_loan_application tool을 신용 위험 평가만 진행한다. 
 3. report_generator: 최종 보고서 작성
 4. FINISH: 프로세스 완료
+
 
 대화 내용을 분석하여 현재 진행 상황을 파악하고 다음 단계를 결정하세요.
 각 단계가 완료되면 다음 단계로 진행하고, 모든 단계가 완료되면 FINISH를 선택하세요.
@@ -71,7 +77,7 @@ PROMPTS = {
 중요사항:
 - get_applicant_information 도구를 사용하여 신청자 정보를 조회하세요
 - applicant_id 매개변수에 정확한 ID(예: A001)를 전달하세요
-- 조회 결과를 명확하게 정리하여 제시하세요
+- 조회 결과를 명확하게 정리하시오.
 
 도구 호출은 다음 JSON 형식을 사용하세요:
 
@@ -79,7 +85,10 @@ PROMPTS = {
 {"name": "get_applicant_information", "arguments": {"applicant_id": "A001"}}
 </tool_call>
 
-사용자 입력에서 신청자 ID를 추출하고 해당 정보를 조회하고 끝내세요
+사용자 입력에서 신청자 ID를 추출하고 해당 정보를 조회하세요.
+
+{user input}
+- 내가 준 ID를 추출해서 내 신용 정보를 조회해줘
 """,
     
     "risk_evaluator": """
@@ -134,9 +143,8 @@ class LoanProcessingGraph:
         
         async def agent_node(state: LoanProcessingState):
             logger.info(f"🔄 Executing {agent_name}")
-            
             # 시스템 프롬프트와 함께 메시지 구성
-            messages_with_prompt = [SystemMessage(content=system_prompt)] + state['messages']
+            messages_with_prompt = [SystemMessage(content=system_prompt+ "USER ID : A001")]
             
             try:
                 result = await agent.ainvoke({"messages": messages_with_prompt})
@@ -147,7 +155,7 @@ class LoanProcessingGraph:
                     logger.error(f"❌ Task-level error in {agent_name}: {last_message.content}")
                     # 오류 상태를 명확히 하고 Supervisor가 다른 결정을 내리도록 유도
                     return {
-                        "messages": state['messages'] + result['messages'],
+                        "messages": state[ 'messages']+ result['messages'],
                         "error_count": state.get("error_count", 0) + 1
                         # "next_node": "error_handler" 와 같은 별도 노드로 보낼 수도 있음
                     }
@@ -202,6 +210,8 @@ class LoanProcessingGraph:
         supervisor_chain = self.create_supervisor_chain()
         
         def supervisor_node(state: LoanProcessingState):
+            logger.info(f"🎯 Current message : {state['messages']}")
+
             logger.info("🎯 Supervisor making routing decision...")
             
             # 오류가 너무 많으면 프로세스 종료
@@ -210,7 +220,9 @@ class LoanProcessingGraph:
                 return {"next_node": "FINISH"}
             
             try:
+                logger.info(f"📍 supervisor message : {state['messages']}") 
                 response = supervisor_chain.invoke({"messages": state['messages']})
+                logger.info(f"📍 supervisor decision message : {response}") 
                 logger.info(f"📍 Supervisor decision: {response.next} - {response.reasoning}")
                 return {"next_node": response.next}
                 
