@@ -8,6 +8,7 @@ import argparse
 
 from mcp_client import MCPClientManager
 from graph_builder import create_optimized_graph, run_loan_evaluation, extract_applicant_id, quick_evaluation
+from IPython.display import Image, display
 
 # 로깅 설정
 def setup_logging(level: str = "INFO"):
@@ -55,7 +56,16 @@ class LoanEvaluationService:
         
         # 그래프 빌드
         self.graph = create_optimized_graph()
-        
+        try:
+            display(
+                Image(
+                    self.graph.get_graph().draw_mermaid_png(
+                        output_file_path="workflow_agents.png"
+                    )
+                )
+            )
+        except Exception:
+            pass
         logger.info("✅ Service initialized successfully")
     
     async def cleanup(self):
