@@ -12,12 +12,13 @@ from langgraph.checkpoint.memory import MemorySaver
 from langchain_ollama import ChatOllama
 
 from mcp_client import (
-    DATA_TOOLS, 
-    EVALUATION_TOOLS,
+    DATA_TOOL, 
+    EVALUATION_TOOL,
+    SEND_EMAIL_TOOL,
     get_applicant_information_tool,
     evaluate_loan_application_tool,
     list_applicants_tool,
-    calculate_score_tool
+    report_email_tool
 )
 
 from dotenv import load_dotenv
@@ -29,14 +30,16 @@ logger = logging.getLogger(__name__)
 class LoanProcessingState(MessagesState):
     """대출 심사 프로세스의 상태를 관리"""
     next_node: str = None
-    applicant_id: str = "A001"
+    applicant_id: str = None # 초기값은 None으로 설정
+    applicant_data: Dict[str, Any] = None # 수집된 신청자 정보를 저장할 필드
+    evaluation_result: Dict[str, Any] = None # 평가 결과를 저장할 필드
     processing_step: str = "start"
     error_count: int = 0
 
 # --- 라우터 모델 ---
 class WorkflowRouter(BaseModel):
     """워크플로우 라우팅 결정을 위한 모델"""
-    next: Literal["data_collector", "risk_evaluator", "report_generator", "FINISH"] = Field(
+    next: Literal["DataCollector", "LoanReview", "ReportSender", "FINISH"] = Field(
         description="다음에 실행할 노드"
     )
     reasoning: str = Field(description="결정 이유")
@@ -47,12 +50,12 @@ def create_llm(temperature: float = 0.1) -> ChatOllama:
     return ChatOllama(
         model="qwen3:8b",  # 더 최신 모델로 변경
         temperature=temperature,
-        top_p=0.9    
+        top_p=0.1    
     )
 
 # --- 에이전트 프롬프트 템플릿 ---
 PROMPTS = {
-    "supervisor": """
+    "Supervisor": """
 [Persona]
 당신은 대출 심사 프로세스를 조율하는 Supervisor Agent입니다.
 
@@ -60,23 +63,23 @@ PROMPTS = {
 - 현재 상태를 분석하여 다음 단계를 결정하세요
 
 [Child Agents Decision Logic]
-1. data_collector: 
+1. DataCollector: 
    - 신청자 정보(applicant_id, name, income, employment_years, credit_score, existing_debt, requested_amount, debt_to_income_ratio)가 메시지에 없는 경우
 
-2. risk_evaluator:
+2. LoanReview:
    - 신청자 정보가 메시지에 포함되어 있는 경우
-   - 아직 평가 결과가 없는 경우
+   - 아직 대출심사 결과가 없는 경우
 
-3. report_generator: 
-   - 신청자 정보가 있고, 평가 결과가 있는 경우
-   - 최종 보고서가 아직 생성되지 않은 경우
+3. ReportSender: 
+   - 신청자 정보가 있고, 대출심사 결과가 있는 경우
+   - is_email_sent가 메시지에 없거나 False인 경우 반드시 작업을 수행해야 합니다.
 
-4. FINISH: 모든 단계가 완료된 경우
+4. FINISH: DataCollector, LoanReview, ReportSender 모두 완료된 경우
 
 메시지 내용을 자세히 분석하여 각 단계의 완료 여부를 정확히 판단하세요.
 """,
     
-    "data_collector": """
+    "DataCollector": """
 당신은 대출 신청자 정보 수집 전문가입니다.
 
 임무: 사용자가 요청한 신청자의 상세 정보를 조회하세요.
@@ -84,7 +87,6 @@ PROMPTS = {
 중요사항:
 - get_applicant_information 도구를 사용하여 신청자 정보를 조회하세요
 - applicant_id 매개변수에 정확한 ID(예: A001)를 전달하세요
-- 조회 결과를 명확하게 정리하시오.
 
 도구 호출은 다음 JSON 형식을 사용하세요:
 
@@ -98,34 +100,36 @@ PROMPTS = {
 - 내가 준 ID를 추출해서 내 신용 정보를 조회해줘
 """,
     
-    "risk_evaluator": """
+    "LoanReview": """
 당신은 대출 신용 위험 평가 전문가입니다.
 
 임무:
 1. 수집된 신청자 정보를 바탕으로 대출 평가를 수행하세요
-2. evaluate_loan_application 도구를 사용하여 종합 평가를 실행하세요
-3. 필요시 calculate_score 도구로 점수 상세 분석을 추가하세요
+2. evaluate_loan_application 도구를 사용하여 종합 평가를 실행하세요.
 
 <tool_call>
 {"name": "evaluate_loan_application", "arguments": {"applicant_id": "A001"}}
 </tool_call>
-
-평가 결과를 명확하게 설명하고 승인/거부 결정의 근거를 제시하세요.
 """,
     
-    "report_generator": """
-당신은 대출 심사 보고서 작성 전문가입니다.
+    "ReportSender": """
+당신은 대출 심사 결과서 작성 후 이메일 전송 전문가입니다.
 
 임무:
-1. 이전 단계에서 수집된 모든 정보를 종합하여 최종 보고서를 작성하세요
-2. 신청자 기본 정보, 평가 결과, 최종 결정을 포함하세요
-3. 고객이 이해하기 쉽도록 명확하고 체계적으로 작성하세요
+1. 먼저 이전 단계에서 수집된 사용자(applicant_id 기준)의 정보를 종합하여 대출 심사 결과서를 작성하세요.
+2. 신청자 기본 정보, 평가 결과만을 사용하여 대출 심사 결과서를 작성하세요.
+3. 고객이 이해하기 쉽도록 명확하고 체계적으로 작성하세요.
+4. 대출 심사 결과서는 한글로 작성되어야 합니다.
+5. 대출 심사 결과서를 작성한 후 report_email 도구를 사용하여 이메일 알림을 전송하세요
 
-보고서는 다음 구성을 포함해야 합니다:
+<tool_call>
+{"name": "report_email", "arguments": {"applicant_id": "A001"}}
+</tool_call>
+
+대출 심사 결과서는 다음 구성을 포함해야 합니다:
 - 신청자 정보 요약
-- 신용 평가 결과  
-- 최종 승인/거부 결정
-- 결정 근거 및 권장사항
+- 신용 평가 결과
+- 최종 대출 심사 결과 정리  
 """
 }
 
@@ -144,7 +148,7 @@ class LoanProcessingGraph:
             messages = input_data.get("messages", [])
             
             # 1. 시스템 프롬프트 (상태 정보 포함)
-            enhanced_system_prompt = PROMPTS["supervisor"]
+            enhanced_system_prompt = PROMPTS["Supervisor"]
             
             # 2. 메시지 분석 및 요약
             analysis_parts = []
@@ -224,11 +228,18 @@ class LoanProcessingGraph:
         
         async def agent_node(state: LoanProcessingState):
             logger.info(f"🔄 Executing {agent_name}")
+            applicant_id = state.get("applicant_id")  # 상태에서 ID 가져오기
             # 시스템 프롬프트와 함께 메시지 구성
-            messages_with_prompt = [SystemMessage(content=system_prompt+ "USER ID : A001")]
+            prompt_with_id = f"{system_prompt}\n\n처리해야 할 신청자 ID는 '{applicant_id}'입니다."
+            
+            # 상태에 따라 메시지 구성
+            messages_with_prompt = [SystemMessage(content=prompt_with_id)]
             
             try:
                 result = await agent.ainvoke({"messages": messages_with_prompt})
+                if agent_name == "ReportSender":
+                    # ReportSender는 결과 메시지를 AIMessage로 변환
+                    print("✅이메일 전송: 완료됨")
                 #logger.info(f"📨 message {result}")
                 # 마지막 메시지가 ToolMessage이고, 오류를 포함하는지 확인
                 last_message = result['messages'][-1]
@@ -299,10 +310,6 @@ class LoanProcessingGraph:
                                 formatted_log_string = "\n" + "\n".join(log_lines)
                                 logger.info(f"\n🧮 [상세 점수 계산 결과]:{formatted_log_string}")
 
-                            # 3. 위에서 정의하지 않은 다른 도구들은 기본 JSON 형태로 출력합니다.
-                            else:
-                                pretty_content = json.dumps(parsed_content, indent=2, ensure_ascii=False)
-                                logger.info(f"🛠️ Tool Result ({tool_name}):\n{pretty_content}")
 
                         except json.JSONDecodeError:
                             logger.error(f"❌ '{tool_name}'의 content를 JSON으로 파싱하는 데 실패했습니다: {message.content}")
@@ -321,11 +328,11 @@ class LoanProcessingGraph:
                 
                 # 상태 업데이트
                 new_state = {"messages": result['messages']}
-                if agent_name == "data_collector":
+                if agent_name == "DataCollector":
                     new_state["processing_step"] = "data_collected"
-                elif agent_name == "risk_evaluator": 
+                elif agent_name == "LoanReview": 
                     new_state["processing_step"] = "evaluated"
-                elif agent_name == "report_generator":
+                elif agent_name == "ReportSender":
                     new_state["processing_step"] = "completed"
                 
                 return new_state
@@ -346,21 +353,21 @@ class LoanProcessingGraph:
         
         # 에이전트 노드들 생성
         data_collector = self.create_agent_node(
-            "data_collector", 
-            DATA_TOOLS, 
-            PROMPTS["data_collector"]
+            "DataCollector", 
+            DATA_TOOL, 
+            PROMPTS["DataCollector"]
         )
         
-        risk_evaluator = self.create_agent_node(
-            "risk_evaluator", 
-            EVALUATION_TOOLS, 
-            PROMPTS["risk_evaluator"]
+        loan_review = self.create_agent_node(
+            "LoanReview", 
+            EVALUATION_TOOL, 
+            PROMPTS["LoanReview"]
         )
         
         report_generator = self.create_agent_node(
-            "report_generator", 
-            [], # 보고서 생성은 도구 없이 LLM만 사용
-            PROMPTS["report_generator"]
+            "ReportSender", 
+            SEND_EMAIL_TOOL, 
+            PROMPTS["ReportSender"]
         )
         
         # Supervisor 노드
@@ -387,31 +394,31 @@ class LoanProcessingGraph:
             except Exception as e:
                 logger.error(f"❌ Supervisor error: {e}")
                 # 기본값으로 데이터 수집부터 시작
-                return {"next_node": "data_collector"}
+                return {"next_node": "DataCollector"}
         
         # 노드들을 그래프에 추가
-        workflow.add_node("supervisor", supervisor_node)
-        workflow.add_node("data_collector", data_collector)
-        workflow.add_node("risk_evaluator", risk_evaluator)
-        workflow.add_node("report_generator", report_generator)
+        workflow.add_node("Supervisor", supervisor_node)
+        workflow.add_node("DataCollector", data_collector)
+        workflow.add_node("LoanReview", loan_review)
+        workflow.add_node("ReportSender", report_generator)
         
         # 엣지 구성
-        workflow.add_edge(START, "supervisor")
-        workflow.add_edge("data_collector", "supervisor")
-        workflow.add_edge("risk_evaluator", "supervisor")
-        workflow.add_edge("report_generator", "supervisor")
+        workflow.add_edge(START, "Supervisor")
+        workflow.add_edge("DataCollector", "Supervisor")
+        workflow.add_edge("LoanReview", "Supervisor")
+        workflow.add_edge("ReportSender", "Supervisor")
         
         # 조건부 엣지 (라우팅)
         def route_supervisor(state: LoanProcessingState):
             return state.get("next_node", "FINISH")
         
         workflow.add_conditional_edges(
-            "supervisor",
+            "Supervisor",
             route_supervisor,
             {
-                "data_collector": "data_collector",
-                "risk_evaluator": "risk_evaluator", 
-                "report_generator": "report_generator",
+                "DataCollector": "DataCollector",
+                "LoanReview": "LoanReview", 
+                "ReportSender": "ReportSender",
                 "FINISH": END
             }
         )
@@ -430,12 +437,17 @@ async def run_loan_evaluation(graph, user_input: str, config: Dict[str, Any] = N
         config = {"configurable": {"thread_id": f"loan-eval-{hash(user_input)}"}}
     
     logger.info(f"🚀 Starting loan evaluation process: {user_input}")
+    applicant_id = extract_applicant_id(user_input) # 사용자 입력에서 ID 추출
+    if not applicant_id:
+        # ID를 찾지 못한 경우 처리
+        return {"status": "error", "message": "입력에서 신청자 ID를 찾을 수 없습니다."}
     
     try:
         # 그래프 실행
         final_state = await graph.ainvoke(
             {
                 "messages": [HumanMessage(content=user_input)],
+                "applicant_id": applicant_id,  # 상태에 동적으로 ID 주입
                 "processing_step": "start",
                 "error_count": 0
             },
@@ -485,14 +497,6 @@ async def _process_final_results(final_state: Dict[str, Any]) -> Dict[str, Any]:
     print("="*60)
     print(f"📊 처리 단계: {result['processing_step']}")
     print(f"⚠️  오류 횟수: {result['error_count']}")
-    print("\n📋 최종 결과:")
-    print("-"*40)
-    
-    if "evaluation_result" in result:
-        print(json.dumps(result["evaluation_result"], indent=2, ensure_ascii=False))
-    else:
-        print(result["final_message"])
-    
     print("="*60)
     
     return result
@@ -552,7 +556,7 @@ async def batch_evaluation(applicant_ids: List[str]) -> Dict[str, Any]:
 
 def get_available_agents() -> List[str]:
     """사용 가능한 에이전트 목록 반환"""
-    return ["data_collector", "risk_evaluator", "report_generator"]
+    return ["DataCollector", "LoanReview", "ReportSender"]
 
 def get_workflow_status(state: LoanProcessingState) -> Dict[str, Any]:
     """현재 워크플로우 상태 정보 반환"""
