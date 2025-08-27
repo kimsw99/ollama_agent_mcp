@@ -33,9 +33,6 @@ class LoanProcessingState(MessagesState):
     applicant_id: str = None # 초기값은 None으로 설정
     applicant_data: Dict[str, Any] = None # 수집된 신청자 정보를 저장할 필드
     evaluation_result: Dict[str, Any] = None # 평가 결과를 저장할 필드
-    applicant_id: str = None # 초기값은 None으로 설정
-    applicant_data: Dict[str, Any] = None # 수집된 신청자 정보를 저장할 필드
-    evaluation_result: Dict[str, Any] = None # 평가 결과를 저장할 필드
     processing_step: str = "start"
     error_count: int = 0
 
@@ -231,7 +228,6 @@ class LoanProcessingGraph:
         
         async def agent_node(state: LoanProcessingState):
             logger.info(f"🔄 Executing {agent_name}")
-            applicant_id = state.get("applicant_id")  # 상태에서 ID 가져오기
             applicant_id = state.get("applicant_id")  # 상태에서 ID 가져오기
             # 시스템 프롬프트와 함께 메시지 구성
             prompt_with_id = f"{system_prompt}\n\n처리해야 할 신청자 ID는 '{applicant_id}'입니다."
