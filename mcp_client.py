@@ -145,11 +145,12 @@ async def evaluate_loan_application(applicant_id: str) -> str:
     result = await _call_mcp_tool("evaluate_loan_application", {"applicant_id": applicant_id})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
-async def calculate_score(applicant_id: str) -> str:
+async def report_email(applicant_id: str) -> str:
     """
-    주어진 지원자 ID에 대해 신용 점수를 계산하고 세부 내역을 반환합니다.
+    주어진 지원자 ID에 대해 대출 신청 심사를 수행하고,
+    그 결과(결정, 점수, 사유)를 반환합니다.
     """
-    result = await _call_mcp_tool("calculate_score", {"applicant_id": applicant_id})
+    result = await _call_mcp_tool("report_email", {"applicant_id": applicant_id})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 # --- LangChain 도구 생성 ---
@@ -172,20 +173,19 @@ evaluate_loan_application_tool = StructuredTool.from_function(
     description="주어진 지원자 ID(applicant_id)에 대해 대출 신청 심사를 수행하고 결과를 반환합니다."
 )
 
-calculate_score_tool = StructuredTool.from_function(
-    coroutine=calculate_score,
-    name="calculate_score",
-    description="주어진 지원자 ID(applicant_id)에 대해 신용 점수를 계산하고 세부 내역을 반환합니다."
+report_email_tool = StructuredTool.from_function(
+    coroutine=report_email,
+    name="report_email",
+    description="주어진 지원자 ID(applicant_id)에 대해 대출 신청 심사 결과에 대한 정보를 요약하고 이메일 알림 결과를 반환합니다."
 )
-
 # 도구 목록 (편의를 위한 그룹화)
 ALL_TOOLS = [
     #list_applicants_tool,
     get_applicant_information_tool,
     evaluate_loan_application_tool,
-    calculate_score_tool
+    report_email_tool
 ]
 
-# DATA_TOOLS = [list_applicants_tool, get_applicant_information_tool]
-DATA_TOOLS = [get_applicant_information_tool]
-EVALUATION_TOOLS = [evaluate_loan_application_tool, calculate_score_tool]
+DATA_TOOL = [get_applicant_information_tool]
+EVALUATION_TOOL = [evaluate_loan_application_tool]
+SEND_EMAIL_TOOL = [report_email_tool]

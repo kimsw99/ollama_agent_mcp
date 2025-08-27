@@ -18,7 +18,7 @@ class Applicant(BaseModel):
     credit_score: int = Field(..., ge=300, le=850, description="신용점수 (300-850)")
     existing_debt: float = Field(..., ge=0, description="기존 채무 합계")
     requested_amount: float = Field(..., gt=0, description="신청 금액")
-
+    email: bool = Field(default=False, description="이메일 알림 여부")
 class LoanDecision(BaseModel):
     decision: str = Field(..., description="승인결과: approve/refer/decline")
     score: int = Field(..., ge=0, le=100, description="심사점수")
@@ -28,19 +28,19 @@ class LoanDecision(BaseModel):
 APPLICANTS: Dict[str, Applicant] = {
     "A001": Applicant(
         id="A001", name="Alice Kim", income=60000, employment_years=5,
-        credit_score=720, existing_debt=5000, requested_amount=20000
+        credit_score=720, existing_debt=5000, requested_amount=20000,email=False
     ),
     "A002": Applicant(
         id="A002", name="Bob Lee", income=18000, employment_years=1,
-        credit_score=560, existing_debt=2000, requested_amount=12000
+        credit_score=560, existing_debt=2000, requested_amount=12000,email=False
     ),
     "A003": Applicant(
         id="A003", name="Charlie Park", income=85000, employment_years=8,
-        credit_score=780, existing_debt=8000, requested_amount=35000
+        credit_score=780, existing_debt=8000, requested_amount=35000,email=False
     ),
     "A004": Applicant(
         id="A004", name="Diana Choi", income=25000, employment_years=2,
-        credit_score=610, existing_debt=15000, requested_amount=18000
+        credit_score=610, existing_debt=15000, requested_amount=18000,email=False
     ),
 }
 
@@ -211,6 +211,22 @@ def calculate_score(applicant_id: str) -> Dict[str, Any]:
             "employment_contribution": round(min(applicant.employment_years / 10.0, 1.0) * 100 * LoanUnderwriter.EMPLOYMENT_WEIGHT, 1),
             "debt_contribution": round(max(0.0, 100.0 - min((applicant.existing_debt / applicant.income) * 100, 200.0)) * LoanUnderwriter.DEBT_WEIGHT, 1)
         }
+    }
+
+
+@mcp.tool()
+def report_email(applicant_id: str) -> Dict[str, Any]:
+    """대출 신청 종합 평가"""
+    if applicant_id not in APPLICANTS:
+        return {"error": f"신청자 {applicant_id}를 찾을 수 없습니다"}
+    
+    applicant = APPLICANTS[applicant_id]
+    if applicant.email == False:
+        applicant.email = True  # 이메일 알림 설정
+    return {
+        "applicant_id": applicant_id,
+        "applicant_name": applicant.name,
+        "is_email_sent": applicant.email
     }
 
 # 레거시 호환성

@@ -84,7 +84,7 @@ class LoanEvaluationService:
     
     async def quick_check(self, applicant_id: str) -> Dict[str, Any]:
         """빠른 신청자 확인"""
-        user_input = f"신청자 {applicant_id}의 정보를 조회하고 간단히 평가해주세요."
+        user_input = f"신청자 {applicant_id}의 정보를 조회하고 대출 신청을 평가해주세요. 마지막으로 대출심사 결과를 이메일로 보내주세요."
         return await self.evaluate_application(user_input)
 
 async def interactive_mode():
