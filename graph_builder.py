@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 class LoanProcessingState(MessagesState):
     """대출 심사 프로세스의 상태를 관리"""
     next_node: str = None
-    applicant_id: str = "A001"
+    applicant_id: str = None # 초기값은 None으로 설정
+    applicant_data: Dict[str, Any] = None # 수집된 신청자 정보를 저장할 필드
+    evaluation_result: Dict[str, Any] = None # 평가 결과를 저장할 필드
     processing_step: str = "start"
     error_count: int = 0
 
@@ -224,8 +226,10 @@ class LoanProcessingGraph:
         
         async def agent_node(state: LoanProcessingState):
             logger.info(f"🔄 Executing {agent_name}")
+            applicant_id = state.get("applicant_id")  # 상태에서 ID 가져오기
             # 시스템 프롬프트와 함께 메시지 구성
-            messages_with_prompt = [SystemMessage(content=system_prompt+ "USER ID : A001")]
+            prompt_with_id = f"{system_prompt}\n\n처리해야 할 신청자 ID는 '{applicant_id}'입니다."
+            messages_with_prompt = [SystemMessage(content=prompt_with_id)]
             
             try:
                 result = await agent.ainvoke({"messages": messages_with_prompt})
@@ -430,12 +434,17 @@ async def run_loan_evaluation(graph, user_input: str, config: Dict[str, Any] = N
         config = {"configurable": {"thread_id": f"loan-eval-{hash(user_input)}"}}
     
     logger.info(f"🚀 Starting loan evaluation process: {user_input}")
+    applicant_id = extract_applicant_id(user_input) # 사용자 입력에서 ID 추출
+    if not applicant_id:
+        # ID를 찾지 못한 경우 처리
+        return {"status": "error", "message": "입력에서 신청자 ID를 찾을 수 없습니다."}
     
     try:
         # 그래프 실행
         final_state = await graph.ainvoke(
             {
                 "messages": [HumanMessage(content=user_input)],
+                "applicant_id": applicant_id,  # 상태에 동적으로 ID 주입
                 "processing_step": "start",
                 "error_count": 0
             },
