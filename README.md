@@ -11,12 +11,30 @@
 
 ## 3. 🧑‍💻 팀원
 
-| 이름 | 담당 기능 |
-|---|---|
-| **김성욱** | 전체 시스템 설계 및 구현 |
-| **김성현** | 전체 시스템 설계 및 구현 |
-| **윤호준** | 전체 시스템 설계 및 구현 |
-| **민지수** | 전체 시스템 설계 및 구현 |
+<table align="center">
+<tr>
+<td align="center" width="200px">
+<img src="./images/team/성현.png" width="150px" alt="김성현"/>
+<br/><b><a href="https://github.com/naisksh32" target="_blank">김성현</a></b><br/>🔸 팀장<br/>
+<i>LLM & Prompt</i>
+</td>
+<td align="center" width="200px">
+<img src="./images/team/성욱.png" width="150px" alt="김성욱"/>
+<br/><b><a href="https://github.com/kimsw99" target="_blank">김성욱</a></b><br/>🔸 팀원<br/>
+<i>Backend</i>
+</td>
+<td align="center" width="200px">
+<img src="./images/team/지수.png" width="150px" alt="민지수"/>
+<br/><b><a href="https://github.com/10mm-notebook" target="_blank">민지수</a></b><br/>🔸 팀원<br/>
+<i>Frontend</i>
+</td>
+<td align="center" width="200px">
+<img src="./images/team/호준.png" width="150px" alt="윤호준"/>
+<br/><b><a href="https://github.com/dev-hojun-yoon" target="_blank">윤호준</a></b><br/>🔸 팀원<br/>
+<i>Backend</i>
+</td>
+</tr>
+</table>
 
 ## 4. 🎯 프로젝트 핵심 기능 (Features)
 
